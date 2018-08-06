@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+
+
+Parameters:
+  Env:
+    Type: "String"
+    AllowedValues:
+      - "Prod"
+      - "Stage"
+    Default: "Stage"
+
+
+Mappings:
+  EnvMap:
+    Prod:
+      PollyTaskTopicName: "on-polly-task-prod"
+      SlackApiSigningSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    Stage:
+      PollyTaskTopicName: "on-polly-task-stage"
+      SlackApiSigningSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+
+Globals:
+  Function:
+    Runtime: "python3.6"
+    Timeout: 30
+    Environment:
+      Variables:
+        ALEXA_COMMAND_PREFIX: "アレクサ、"
+        SLACK_API_SIGNING_SECRET: !FindInMap [ "EnvMap", !Ref "Env", "SlackApiSigningSecret" ]
+        POLLY_TASK_TOPIC_ARN:
+          Fn::Join:
+            - ""
+            - - "arn:aws:sns:"
+              - !Ref "AWS::Region"
+              - ":"
+              - !Ref "AWS::AccountId"
+              - ":"
+              - !FindInMap [ "EnvMap", !Ref "Env", "PollyTaskTopicName" ]
+
+
+Resources:
+
+  #
+  # SlackAppHandler
+  #
+  SlackAppHandler:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: !Join [ "-", [ "SlackAppHandler", !Ref "Env" ] ]
+      CodeUri: "slack_app/build/"
+      Handler: "app.lambda_handler"
+      Policies:
+        - "AmazonSNSFullAccess"
+      Events:
+        SlackAPI:
+          Type: "Api"
+          Properties:
+            Path: "/alexa"
+            Method: "post"
+            RestApiId: !Ref "SlackApp"
+
+  LambdaPermissionSlackAppHandler:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref "SlackAppHandler"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn:
+        Fn::Join:
+          - ""
+          - - "arn:aws:execute-api:"
+            - !Ref "AWS::Region"
+            - ":"
+            - !Ref "AWS::AccountId"
+            - ":"
+            - !Ref "SlackApp"
+            - "/*/*/*"
+
+  #
+  # PollyTask
+  #
+  PollyTask:
+    Type: "AWS::Serverless::Function"
+    DependsOn: "PollyTaskTopic"
+    Properties:
+      FunctionName: !Join [ "-", [ "PollyTask", !Ref "Env" ] ]
+      CodeUri: "polly_task/build/"
+      Handler: "app.lambda_handler"
+      Policies:
+        - "AWSIoTDataAccess"
+      Events:
+        EventFromSlack:
+          Type: "SNS"
+          Properties:
+            Topic: !Ref "PollyTaskTopic"
+
+  LambdaPermissionPollyTask:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt [ "PollyTask", "Arn" ]
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref "PollyTaskTopic"
+
+  #
+  # IPC between SlackAppHandler and PollyTask
+  #
+  PollyTaskTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: !FindInMap [ "EnvMap", !Ref "Env", "PollyTaskTopicName" ]
+      DisplayName: !FindInMap [ "EnvMap", !Ref "Env", "PollyTaskTopicName" ]
+
+  #
+  # API Gateway
+  #
+  SlackApp:
+    Type: "AWS::Serverless::Api"
+    Properties:
+      Name: !Join [ "-", [ "SlackApp", !Ref "Env" ] ]
+      StageName: "Prod"
+      MethodSettings:
+        - {
+            DataTraceEnabled: true,
+            LoggingLevel: "INFO",
+            ResourcePath: "/*",
+            HttpMethod: "*"
+          }
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          version: "1.0.0"
+          title: !Join [ "-", [ "SlackApp", !Ref "Env" ] ]
+        paths:
+          /alexa:
+            post:
+              consumes:
+                - "application/x-www-form-urlencoded"
+              produces:
+                - "text/plain; charset=utf-8"
+              responses:
+                "200": { description: "successful operation" }
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SlackAppHandler.Arn}/invocations
+                httpMethod: "POST"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                responses:
+                  default: { statusCode: "200" }
+
+  SlackAppDomainMap:
+    Type: "AWS::ApiGateway::BasePathMapping"
+    DependsOn: "SlackApp"
+    Properties:
+      BasePath: !Ref "Env"
+      DomainName: "example.com"
+      RestApiId: !Ref "SlackApp"
+      Stage: !Ref "SlackApp.Stage"

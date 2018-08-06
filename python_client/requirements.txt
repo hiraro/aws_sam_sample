@@ -1,0 +1,5 @@
+AWSIoTPythonSDK
+boto3
+fasteners
+pydub
+pyaudio
